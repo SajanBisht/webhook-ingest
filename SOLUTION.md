@@ -1,40 +1,56 @@
-What was broken, and why
+# SOLUTION.md – Webhook Ingestion Fixes
 
-1) Duplicate events and drifting call counts:
-- Root cause: the events table did not enforce uniqueness on event_id and the ingestion flow first checked for existence then performed an INSERT. This created a race: two near-simultaneous deliveries could both see "not exists" and both insert, producing duplicate event rows and double-counting in account_stats.
+## What was broken, and why
 
-2) Recordings never reliably marked processed and in-flight work lost on deploy:
-- Root cause: recording processing was launched as a goroutine using the request context. The request context may be cancelled after the HTTP response or when the server shuts down, so background work could be abandoned without logs or retries. The code also ignored errors from the processing goroutine.
+### 1. Duplicate events and drifting call counts
+- **Root cause:** the `events` table did not enforce uniqueness on `event_id`, and the ingestion flow performed an existence check (`SELECT`) before inserting (`INSERT`).  
+- Under concurrent deliveries (which our provider sends during retries), two requests could both see “not exists” and proceed to insert, creating duplicate event rows and double‑counting stats in `account_stats`.
 
-What was changed
+### 2. Recordings never reliably marked processed, and in‑flight work disappeared on deploy
+- Recording processing was launched as a goroutine that used the **HTTP request context**.  
+- When the request finished or the server shut down, the context was cancelled – meaning the background work was abandoned silently (no retries, no logs).  
+- The code also ignored errors from the processing goroutine, making it impossible to tell whether a recording was ever processed.
 
-1) Make event insertion atomic and idempotent
-- Added a new migration (migrations/002_unique_event_id.sql) to enforce uniqueness on events.event_id at the database level.
-- Reworked InsertEvent to use INSERT ... ON CONFLICT (event_id) DO NOTHING and return a boolean (inserted) indicating whether a row was created. This is atomic and avoids a read-then-write race.
-- The ingest flow now relies on InsertEvent's result: if the insert did not create a row, the delivery is treated as a duplicate and the handler returns early, avoiding double-counting and duplicate call rows.
+---
 
-2) Fixed cache concurrency bug
-- stats.Cache.Record now acquires the mutex when updating the in-memory totals (previously it mutated the map and counters without locking), preventing races under concurrent requests.
+## What was changed
 
-3) Make recording processing more robust
-- The recording-processing goroutine now uses context.Background() (so it is not cancelled with the HTTP request) and any error during processing is logged. This prevents work from being accidentally cancelled when the request finishes; a production-ready system would push such work to a durable queue for retries.
+### 1. Make event insertion atomic and idempotent
+- Added a new migration (`migrations/002_unique_event_id.sql`) to enforce `UNIQUE` on `events.event_id` at the database level.  
+- Reworked `InsertEvent` to use `INSERT ... ON CONFLICT (event_id) DO NOTHING` and return a boolean (`inserted`) indicating whether a row was created.  
+- The ingest flow now checks this result: if `inserted` is `false`, the delivery is treated as a duplicate and the handler returns early – preventing double‑counting and duplicate call rows.
 
-Why this deduplication strategy was chosen
+### 2. Fixed a cache concurrency bug
+- `stats.Cache.Record` now acquires its mutex before updating the in‑memory totals. Previously it mutated the map and counters without locking, which caused races under concurrent requests.
 
-Options considered:
-- Rely exclusively on application-level existence checks (SELECT then INSERT). Rejected: read-then-write races permit duplicates under concurrency.
-- Use Redis to track delivered event_ids with an expiry. This is workable but moves the durability/truth into Redis and still requires coordination with the DB when updating durable aggregates.
-- Use a database-side uniqueness constraint and an atomic INSERT with ON CONFLICT DO NOTHING. Chosen: it is simple, durable, single-source-of-truth, and forces correct behavior even if the application is concurrently running in multiple processes or after restarts. Also it keeps the code path simple and avoids extra distributed coordination.
+### 3. Make recording processing robust
+- The recording‑processing goroutine now uses `context.Background()` so it is not cancelled when the HTTP request finishes.  
+- Any error during processing is logged.  
+- **Note:** a production system would push this work to a durable queue for guaranteed retries; this change removes the immediate cancellation risk and adds visibility.
 
-What would change at 10,000 webhooks/sec
+---
 
-- Move recording processing and any other long-running work off the web request path into a durable work queue (e.g., Postgres advisory queue, Redis Streams, or a message broker). Workers would ack and retry jobs until successful, providing durability across deploys.
-- Use batched or incremental updates to account aggregates when possible, or maintain a write-optimized table and compute aggregates asynchronously to reduce contention on account_stats for hot accounts.
-- Provision strong DB resources and connection pools; consider sharding or partitioning account_stats if single-row hot spots appear.
-- Add metrics and observability (histograms for processing time, counters for duplicates and errors) and structured retry/backoff policies for transient failures.
+## Why this deduplication strategy was chosen over alternatives
 
-Notes and follow-ups
+| Approach | Why it was rejected |
+| :--- | :--- |
+| **SELECT then INSERT** (application‑side check) | Read‑then‑write races permit duplicates under concurrency – it is **not atomic**. |
+| **Redis with TTL** | Moves the source of truth into a volatile cache. It still needs coordination with the DB when updating aggregates, and if Redis restarts or the TTL expires before the provider stops retrying, duplicates can slip through. |
+| **Postgres UNIQUE + `ON CONFLICT DO NOTHING`** (chosen) | **Simple, durable, and ACID‑compliant.** It provides a single source of truth, works across multiple instances and restarts, and keeps the code path clean without extra distributed coordination. It is also the natural fit because the data is already stored in Postgres. |
 
-- I added a test (TestConcurrentDuplicateDeliveryIsIgnored) that posts the same event concurrently to demonstrate and guard against the race. It would fail against the original code and pass with the database uniqueness + ON CONFLICT approach.
-- The overall durability of recording processing still needs work: the current change makes the goroutine less likely to be cancelled immediately, but durable, restart-proof processing requires a queue/worker design.
+---
 
+## What would change at 10,000 webhooks/second
+
+- **Move long‑running work off the request path** – recording processing and any other heavy tasks would go into a durable queue (e.g., Postgres advisory queue, Redis Streams, or a proper message broker). Workers would acknowledge and retry jobs until success, making deploys safe.
+- **Batch or async aggregate updates** – instead of updating `account_stats` on every single webhook, we would batch increments in Redis and flush them periodically, or maintain a write‑optimised staging table and recompute aggregates asynchronously.
+- **Scale the database** – provision strong DB resources, tune connection pools, and consider partitioning or sharding `account_stats` to avoid hot‑row contention for popular accounts.
+- **Add observability** – expose metrics for processing latency, duplicate rates, and error counts, with structured logging and distributed tracing to spot bottlenecks quickly.
+- **Idempotency at scale** – keep the Postgres UNIQUE constraint, but add a **Redis‑side bloom filter** or TTL cache as a cheap first check to reduce DB load; the DB remains the ultimate source of truth.
+
+---
+
+## Notes and follow‑ups
+
+- A new concurrent test (`TestConcurrentDuplicateDeliveryIsIgnored`) was added to reproduce and guard against the race. It fails on the original code and passes with the `ON CONFLICT` fix.
+- The recording processing fix removes **immediate cancellation**, but truly durable processing would require a queue/worker architecture – this is called out as the top priority if the service were scaled further.
